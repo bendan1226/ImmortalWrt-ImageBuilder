@@ -1,0 +1,532 @@
+name: Build HD9901 ImmortalWrt 24.10
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+
+      # =========================================================
+      # 1. 获取当前仓库
+      # =========================================================
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+
+      # =========================================================
+      # 2. 检查 HD9901 文件
+      # =========================================================
+
+      - name: Check HD9901 files
+        run: |
+          set -eux
+
+          echo "===== Repository ====="
+          pwd
+
+          echo "===== HD9901 directory ====="
+          ls -lah hd9901/
+
+          test -f hd9901/hd9901.dtb
+          test -f hd9901/old-boot-area.part00
+          test -f hd9901/old-boot-area.part01
+
+          echo "===== DTB ====="
+          file hd9901/hd9901.dtb
+          ls -lh hd9901/hd9901.dtb
+
+          echo "===== Boot area ====="
+          ls -lh hd9901/old-boot-area.part00
+          ls -lh hd9901/old-boot-area.part01
+
+
+      # =========================================================
+      # 3. 安装镜像处理工具
+      # =========================================================
+
+      - name: Install image tools
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            docker.io \
+            parted \
+            util-linux \
+            kpartx \
+            e2fsprogs \
+            dosfstools \
+            gzip \
+            xz-utils \
+            file \
+            device-tree-compiler
+
+
+      # =========================================================
+      # 4. 准备 ImageBuilder
+      #
+      # 使用原项目已经验证过的 ImageBuilder
+      # 不重新编译 OpenWrt
+      # =========================================================
+
+      - name: Prepare ImageBuilder
+        run: |
+          set -eux
+
+          chmod +x rockchip/build24.sh
+
+          mkdir -p bin
+          mkdir -p custom
+
+
+      # =========================================================
+      # 5. 使用原项目的 ImageBuilder 制作 NanoPC-T4 镜像
+      #
+      # 注意：
+      # 这里故意使用 friendlyarm_nanopc-t4
+      #
+      # 因为 HD9901 本身没有 ImageBuilder PROFILE。
+      # 后面我们再把 DTB 替换成 HD9901。
+      # =========================================================
+
+      - name: Build base RK3399 image
+        run: |
+          set -eux
+
+          PROFILE="friendlyarm_nanopc-t4"
+
+          ROOTFS_SIZE="1024"
+
+          echo "PROFILE=$PROFILE"
+          echo "ROOTFS_SIZE=$ROOTFS_SIZE"
+
+          docker run --rm -i \
+            --user root \
+            -v "${{ github.workspace }}/bin:/home/build/immortalwrt/bin" \
+            -v "${{ github.workspace }}/files:/home/build/immortalwrt/files" \
+            -v "${{ github.workspace }}/custom:/home/build/immortalwrt/files/etc/config" \
+            -v "${{ github.workspace }}/arch/arch.conf:/home/build/immortalwrt/files/etc/opkg/arch.conf" \
+            -v "${{ github.workspace }}/rockchip/imm.config:/home/build/immortalwrt/.config" \
+            -v "${{ github.workspace }}/shell:/home/build/immortalwrt/shell" \
+            -v "${{ github.workspace }}/rockchip/build24.sh:/home/build/immortalwrt/build.sh" \
+            -e PROFILE="$PROFILE" \
+            -e INCLUDE_DOCKER="no" \
+            -e ROOTFS_PARTSIZE="$ROOTFS_SIZE" \
+            -e ENABLE_PPPOE="no" \
+            -e PPPOE_ACCOUNT="" \
+            -e PPPOE_PASSWORD="" \
+            immortalwrt/imagebuilder:rockchip-armv8-openwrt-24.10.6 \
+            /bin/bash \
+            /home/build/immortalwrt/build.sh
+
+
+      # =========================================================
+      # 6. 查找 ImageBuilder 生成的镜像
+      # =========================================================
+
+      - name: Find generated image
+        run: |
+          set -eux
+
+          echo "===== Generated files ====="
+
+          find bin/targets \
+            -type f \
+            -maxdepth 10 \
+            -print \
+            | sort
+
+          IMAGE_GZ=$(find bin/targets \
+            -type f \
+            -name '*.img.gz' \
+            | head -n 1)
+
+          if [ -z "$IMAGE_GZ" ]; then
+            echo "ERROR: No .img.gz image found!"
+            exit 1
+          fi
+
+          echo "IMAGE_GZ=$IMAGE_GZ"
+
+          echo "IMAGE_GZ=$IMAGE_GZ" >> "$GITHUB_ENV"
+
+
+      # =========================================================
+      # 7. 解压镜像
+      # =========================================================
+
+      - name: Extract image
+        run: |
+          set -eux
+
+          gzip -dc \
+            "$IMAGE_GZ" \
+            > HD9901-base.img
+
+          echo "===== Base image ====="
+
+          ls -lh HD9901-base.img
+
+          file HD9901-base.img
+
+          echo "===== Partition table ====="
+
+          sudo fdisk -l HD9901-base.img
+
+
+      # =========================================================
+      # 8. 挂载镜像 Boot 分区
+      #
+      # NanoPC-T4 / Rockchip ImageBuilder 镜像的启动文件
+      # 我们需要在这里寻找 rockchip.dtb
+      # =========================================================
+
+      - name: Mount boot partition
+        run: |
+          set -eux
+
+          sudo mkdir -p /mnt/hd9901-boot
+
+          sudo losetup -Pf \
+            --show \
+            HD9901-base.img \
+            > loopdev.txt
+
+          LOOPDEV=$(cat loopdev.txt)
+
+          echo "LOOPDEV=$LOOPDEV"
+          echo "LOOPDEV=$LOOPDEV" >> "$GITHUB_ENV"
+
+          echo "===== Loop partitions ====="
+
+          ls -lah "${LOOPDEV}"*
+
+          sudo fdisk -l "$LOOPDEV"
+
+
+          # -------------------------------------------------
+          # 找到第一个分区
+          # -------------------------------------------------
+
+          if [ -b "${LOOPDEV}p1" ]; then
+            BOOTDEV="${LOOPDEV}p1"
+          else
+            BOOTDEV="${LOOPDEV}1"
+          fi
+
+          echo "BOOTDEV=$BOOTDEV"
+          echo "BOOTDEV=$BOOTDEV" >> "$GITHUB_ENV"
+
+
+          # -------------------------------------------------
+          # 挂载 Boot 分区
+          # -------------------------------------------------
+
+          sudo mount "$BOOTDEV" /mnt/hd9901-boot
+
+          echo "===== Boot partition ====="
+
+          sudo find /mnt/hd9901-boot \
+            -maxdepth 2 \
+            -type f \
+            -print \
+            | sort
+
+
+      # =========================================================
+      # 9. 检查 NanoPC-T4 DTB
+      # =========================================================
+
+      - name: Check base DTB
+        run: |
+          set -eux
+
+          echo "===== Boot files ====="
+
+          sudo ls -lah /mnt/hd9901-boot/
+
+          echo "===== Search DTB ====="
+
+          sudo find /mnt/hd9901-boot \
+            -type f \
+            \( \
+              -name '*.dtb' \
+              -o \
+              -name 'rockchip.dtb' \
+            \) \
+            -print
+
+
+          if [ -f /mnt/hd9901-boot/rockchip.dtb ]; then
+
+            echo "Found rockchip.dtb"
+
+            sudo file \
+              /mnt/hd9901-boot/rockchip.dtb
+
+            sudo dtc \
+              -I dtb \
+              -O dts \
+              /mnt/hd9901-boot/rockchip.dtb \
+              > /tmp/base.dts
+
+            echo "===== Base DTB compatible ====="
+
+            grep -A5 -B2 \
+              'compatible' \
+              /tmp/base.dts \
+              | head -30
+
+          else
+
+            echo "ERROR: rockchip.dtb was not found!"
+
+            echo "All boot files:"
+
+            sudo find /mnt/hd9901-boot \
+              -type f \
+              -print
+
+            exit 1
+
+          fi
+
+
+      # =========================================================
+      # 10. 检查 HD9901 DTB
+      # =========================================================
+
+      - name: Check HD9901 DTB
+        run: |
+          set -eux
+
+          echo "===== HD9901 DTB ====="
+
+          file hd9901/hd9901.dtb
+
+          dtc \
+            -I dtb \
+            -O dts \
+            hd9901/hd9901.dtb \
+            > /tmp/hd9901.dts
+
+          echo "===== HD9901 compatible ====="
+
+          grep -A5 -B2 \
+            'compatible' \
+            /tmp/hd9901.dts \
+            | head -30
+
+
+      # =========================================================
+      # 11. 替换 rockchip.dtb
+      # =========================================================
+
+      - name: Replace DTB
+        run: |
+          set -eux
+
+          test -f /mnt/hd9901-boot/rockchip.dtb
+          test -f hd9901/hd9901.dtb
+
+          echo "===== Before ====="
+
+          sudo ls -lh \
+            /mnt/hd9901-boot/rockchip.dtb
+
+
+          echo "===== Replace ====="
+
+          sudo cp \
+            hd9901/hd9901.dtb \
+            /mnt/hd9901-boot/rockchip.dtb
+
+
+          sync
+
+
+          echo "===== After ====="
+
+          sudo ls -lh \
+            /mnt/hd9901-boot/rockchip.dtb
+
+
+          echo "===== Verify ====="
+
+          sudo file \
+            /mnt/hd9901-boot/rockchip.dtb
+
+
+      # =========================================================
+      # 12. 卸载 Boot 分区
+      # =========================================================
+
+      - name: Unmount image
+        run: |
+          set -eux
+
+          sync
+
+          sudo umount \
+            /mnt/hd9901-boot
+
+          sudo losetup -d \
+            "$LOOPDEV"
+
+
+      # =========================================================
+      # 13. 恢复 HD9901 原始 Bootloader
+      #
+      # 保留：
+      #   sector 0 = ImageBuilder 新镜像分区表
+      #
+      # 恢复：
+      #   sector 1~65535 = 原 HD9901 Bootloader
+      #
+      # 这样不会把原镜像的旧分区表重新覆盖回来。
+      # =========================================================
+
+      - name: Restore HD9901 bootloader
+        run: |
+          set -eux
+
+          echo "===== Rebuild original boot area ====="
+
+          cat \
+            hd9901/old-boot-area.part00 \
+            hd9901/old-boot-area.part01 \
+            > old-boot-area.bin
+
+
+          BOOT_SIZE=$(stat -c%s old-boot-area.bin)
+
+          echo "BOOT_SIZE=$BOOT_SIZE"
+
+
+          if [ "$BOOT_SIZE" -ne 33554432 ]; then
+            echo "ERROR: Boot area must be exactly 32 MiB"
+            exit 1
+          fi
+
+
+          echo "===== Restore bootloader ====="
+
+          sudo dd \
+            if=old-boot-area.bin \
+            of=HD9901-base.img \
+            bs=512 \
+            skip=1 \
+            seek=1 \
+            count=65535 \
+            conv=notrunc \
+            status=progress
+
+
+          sync
+
+
+      # =========================================================
+      # 14. 最终检查
+      # =========================================================
+
+      - name: Verify final image
+        run: |
+          set -eux
+
+          echo "===== Final image ====="
+
+          ls -lh HD9901-base.img
+
+          file HD9901-base.img
+
+          echo "===== Final partition table ====="
+
+          sudo fdisk -l HD9901-base.img
+
+
+          echo "===== SHA256 ====="
+
+          sha256sum HD9901-base.img
+
+
+      # =========================================================
+      # 15. 压缩
+      # =========================================================
+
+      - name: Compress final image
+        run: |
+          set -eux
+
+          gzip -c \
+            HD9901-base.img \
+            > HD9901-ImmortalWrt-24.10.6.img.gz
+
+
+          sha256sum \
+            HD9901-base.img \
+            HD9901-ImmortalWrt-24.10.6.img.gz \
+            > SHA256SUMS.txt
+
+
+          zip \
+            HD9901-ImmortalWrt-24.10.6.zip \
+            HD9901-base.img \
+            HD9901-ImmortalWrt-24.10.6.img.gz \
+            SHA256SUMS.txt
+
+
+          ls -lh \
+            HD9901-base.img \
+            HD9901-ImmortalWrt-24.10.6.img.gz \
+            HD9901-ImmortalWrt-24.10.6.zip \
+            SHA256SUMS.txt
+
+
+      # =========================================================
+      # 16. 上传 Artifact
+      # =========================================================
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HD9901-ImmortalWrt-24.10.6
+          path: |
+            HD9901-base.img
+            HD9901-ImmortalWrt-24.10.6.img.gz
+            HD9901-ImmortalWrt-24.10.6.zip
+            SHA256SUMS.txt
+          if-no-files-found: error
+
+
+      # =========================================================
+      # 17. 发布 Release
+      # =========================================================
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: HD9901-24.10.6
+          name: HD9901 ImmortalWrt 24.10.6
+          body: |
+            HD9901 RK3399 ImmortalWrt 24.10.6
+
+            Base:
+            friendlyarm_nanopc-t4 ImageBuilder
+
+            Custom:
+            HD9901 DTB
+
+            Bootloader:
+            Original HD9901 boot area
+          files: |
+            HD9901-base.img
+            HD9901-ImmortalWrt-24.10.6.img.gz
+            HD9901-ImmortalWrt-24.10.6.zip
+            SHA256SUMS.txt
