@@ -1,4 +1,4 @@
-# 已同步 ophub/amlogic-s9xxx-openwrt 的 2026.11 版机型库与内核列表（tag: OpenWrt_openwrt_main_save_2026.11）
+# 已同步 ophub main 提交 b0d3a707ff789e80c93e05b7335cedff4838018c（2026-11-21），机型库 253 项、内核含 6.18.y
 name: Build boxs by ophub
 on:
   workflow_dispatch:
@@ -405,7 +405,7 @@ jobs:
           echo "file=$ROOTFS_FILE" >> $GITHUB_OUTPUT
 
       - name: Package armsr-armv8 as ImmortalWrt by ophub
-        uses: ophub/amlogic-s9xxx-openwrt@OpenWrt_openwrt_main_save_2026.11
+        uses: ophub/amlogic-s9xxx-openwrt@b0d3a707ff789e80c93e05b7335cedff4838018c
         with:
           openwrt_path: ${{ steps.find_rootfs.outputs.file }}
           openwrt_board: ${{ inputs.openwrt_board }}
